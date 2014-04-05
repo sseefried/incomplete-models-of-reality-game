@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<project>
+
+	<meta title="JumpingBox" package="com.example.jumpingbox" version="1.0.0" company="Company Name" />
+	<app main="Main" path="Export" file="JumpingBox" />
+
+	<source path="Source" />
+
+
+
+<window width="512" height="512"
+	      orientation="portrait"
+	      fps="60"
+	      background="0x000000"
+	      resizable="false"
+	      borderless="false" />
+
+
+	<haxelib name="openfl" />
+
+	<assets path="Assets" rename="assets" exclude="openfl.svg" />
+	<icon path="Assets/openfl.svg" />
+
+</project>
