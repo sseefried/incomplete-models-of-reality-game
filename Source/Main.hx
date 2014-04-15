@@ -7,15 +7,54 @@ import flash.events.Event; // required for addEventListener
 import flash.events.KeyboardEvent;
 import flash.ui.Keyboard;
 
+import box2D.collision.shapes.B2PolygonShape;
+import box2D.common.math.B2Vec2;
+import box2D.dynamics.B2Body;
+import box2D.dynamics.B2BodyDef;
+import box2D.dynamics.B2FixtureDef;
+import box2D.dynamics.B2Fixture;
+import box2D.dynamics.B2World;
+import box2D.collision.shapes.B2ShapeType;
+import box2D.dynamics.B2DebugDraw;
+import box2D.dynamics.contacts.B2Contact;
+
+
+/*
+ * Co-ordinate system.
+ *
+ * Nearly all functions that take co-ordindate values will take values in
+ * "world co-ordinates", not in screen co-ordinates.
+ *
+ * Most 2D graphics libraries (flash.display.Graphics included)
+ * use a co-ordinate system where the x-axis goes from left-to-right
+ * and the y-axis goes from top-to-bottom. I'm going to call this a
+ * screen co-ordinate system.
+ *
+ * This is not the Cartesian co-ordinate system I learned in high school, where
+ * the y axis goes from bottom-to-top, so like one of those annoying
+ * people who has to invert the Y-axis in a first person shooter game,
+ * I am going to transform from virtual co-ordinates in a Cartesian system
+ * to the screen co-ordinate system.
+ *
+ * Each unit of this system will be a "block" in the game. The world
+ * is Level.BLOCKS_IN_ROW wide and high. (The world is sqaure, not rectangular.)
+ *
+ * We are using Box2D as the physics system. Box2D performs its calculations
+ * using values that correspond to physical SI units. Thus, we set each
+ * block to be 1m x 1m i.e. 1 square metre. This means that we can equally well
+ * say that the player is moving at 2 blocks per second or 2 m/s.
+ *
+ */
+
+typedef UserData = { isSensor: Bool }
+
 typedef Point = { x: Int, y: Int }
 
+// Blocks are either Red, Blue or a space.
 enum Block { Red; Blue; Space; }
-enum Side { Top; Bottom; Left; Right;}
-typedef Rect = { x1: Float, x2: Float, y1: Float, y2: Float};
-typedef Collision = { left: Bool, right: Bool, top: Bool, bottom: Bool}
 
 enum Pair<T,U> {
-  Pair(v : T, u: U);
+  Pair(fst : T, snd: U);
 }
 
 enum Option<T> {
@@ -27,15 +66,34 @@ enum Option<T> {
 class Level {
 	public static var BLOCKS_IN_ROW = 8;
 
-	public var player: Point;
+	public var initPlayerPos: Point;
 	public var blocks:  Array<Array<Block>>;
 
-	public function new(s: String) {
+  //
+  // The new function parses an array of strings [ss] that defines the level. The string must have
+  // exactly BLOCK_IN_ROW^2 characters, and each of those characters must be an ['R'], ['B'], [' ']
+  // or ['P'] character.
+  //
+  // Each element of [ss] defines a row of the level. The array is traversed in reverse order so
+  // that the last element defines the bottom row, the penultimate element defines the second row,
+  // etc. This is done so that one may draw the level using ASCII art in the source code. e.g.
+  //
+  //  var ss = [ "        "
+  //           , "        "
+  //           , " BB B   "
+  //           , "     B  "
+  //           , "   P   R"
+  //           , "      R "
+  //           , "     R  "
+  //           , "RRRRRRRR" ];
+  //
+  //
+	public function new(ss: Array<String>) {
 		blocks = new Array();
 		for (j in 0...BLOCKS_IN_ROW) {
 			blocks[j] = new Array();
 			for (i in 0...BLOCKS_IN_ROW) {
-				var val = s.charAt((BLOCKS_IN_ROW - j - 1)*BLOCKS_IN_ROW+i);
+				var val = ss[(BLOCKS_IN_ROW - 1) - j].charAt(i);
 				if (val == "R") {
 					blocks[j][i] = Red;
 				} else if (val == "B") {
@@ -44,49 +102,99 @@ class Level {
 					blocks[j][i] = Space;
 				}
 				if (val == "P") {
-					player = { x: i, y: j};
+					initPlayerPos = { x: i, y: j};
 				}
 			}
 		}
 	}
 }
 
+typedef Player = { movingLeft: Bool, movingRight: Bool, jumping: Bool, body: B2Body,
+                   contacts: Int }
+
+class PlayerContactListener extends box2D.dynamics.B2ContactListener {
+
+  private var player: Player;
+
+  public function new(p: Player) {
+    super();
+    player = p;
+  }
+
+  public override function beginContact(contact:B2Contact):Void {
+    var ud: UserData = contact.getFixtureB().getUserData();
+    if (ud != null && ud.isSensor) {
+      player.contacts += 1;
+    }
+  }
+
+  public override function endContact(contact:B2Contact):Void {
+    var ud: UserData = contact.getFixtureB().getUserData();
+    if (ud != null && ud.isSensor) {
+      player.contacts -= 1;
+    }
+  }
+
+}
+
 class Main extends Sprite {
 
-	// all as a fraction of a block width
-	private static var ACCEL:Float = 0.01;
-	private static var JUMP_VELOCITY:Float = 0.2;
-	private static var RUN_VELOCITY:Float = 0.05;
+	// all as a fraction of a block
+	private static var JUMP_VELOCITY:Float = 4.5;
+	private static var RUN_VELOCITY:Float = 2;
 	private static var PLAYER_WIDTH:Float = 0.25;
 	private static var PLAYER_HEIGHT = 0.5;
 
-  // Visible blocks
+  private static var BLOCK_WIDTH: Float = 1.0;
+  private static var STEPS_PER_SECOND = 30;  // Box2D steps per second.
+
+  // The block sorts that are currently visible. e.g. [ Red ]
   private var visibleBlocks: Array<Block>;
 
-	private var levelString: String =
-    "        " +
-    "        " +
-    " BB B   " +
-    "     B  " +
-    "   P   R" +
-    "      R " +
-    "     R  " +
-    "RRRRRRRR";
+	private var levelString: Array<String> =
+    [ "        "
+    , "        "
+    , " BB B   "
+    , "     B  "
+    , "   P   R"
+    , "      R "
+    , "     R  "
+    , "RRRRRRRR" ];
 
-	// screen width/height
+	// screen width/height. These values are set to mirror those from project.xml
 	private var w:Int;
 	private var h:Int;
 
-	// world width/height
-	private var scale:Float;
-	private var box:{ x: Float, y: Float, v: Float, movingLeft: Bool,
-	                  movingRight: Bool, jumpPressed: Bool } ;
+  private var physics_width: Float; // For Box2D. In metres
+  // multiply screen co-ordinates by [scale] to get world co-ordinates.
+  private var scale: Float;
+  private var world: B2World; // Box2D world.
+
+
+	private var player: Player;
 
   private var level: Level;
   private var blockWidth: Float;
 
+  private function setupDebugDraw(world: B2World, scale: Float) {
+    var physicsDebug = new Sprite ();
+    addChild (physicsDebug);
+
+
+    var debugDraw = new B2DebugDraw ();
+    debugDraw.setSprite (physicsDebug);
+    debugDraw.setDrawScale (scale);
+    debugDraw.setFlags (B2DebugDraw.e_shapeBit);
+    world.setDebugDraw (debugDraw);
+
+  }
+
 	public function new() {
 		super();
+
+    var i: Int;
+    var j: Int;
+
     stage.addEventListener(Event.ENTER_FRAME, onEnterFrame);
     stage.addEventListener(KeyboardEvent.KEY_DOWN, onKeyDown);
     stage.addEventListener(KeyboardEvent.KEY_UP, onKeyUp);
@@ -94,111 +202,136 @@ class Main extends Sprite {
     w = stage.stageWidth;
     h = stage.stageHeight;
 
-    blockWidth = w/Level.BLOCKS_IN_ROW;
     level = new Level(levelString);
-    box = { x: level.player.x*blockWidth, y: level.player.y*blockWidth,
-    	         v: 0, movingRight: false,
-               movingLeft: false, jumpPressed: false};
+
+    physics_width = Level.BLOCKS_IN_ROW;
+    scale = w/(Level.BLOCKS_IN_ROW*BLOCK_WIDTH);
+
+    world = new B2World(new B2Vec2(0, -10.0), false);
+
+    setupDebugDraw(world, scale);
+
     visibleBlocks = [Red];
 
-
-	}
-
-	// world co-ordinates use left-handed co-ordinate system. x axis points right
-	// y axis points up.
-	private function drawBox(x: Float, y: Float, w: Float, h: Float, color: UInt) {
-		graphics.beginFill(color);
-		graphics.drawRect(x, this.h - (h+y), w, h);
-	}
-
-	private function overlaps(a: Rect, b: Rect): Option<Collision> {
-		var right = b.x2 <= a.x1;
-		var left  = a.x2 <= b.x1;
-		var above = b.y2 <= a.y1;
-		var below = a.y2 <= b.y1;
-
-		var o = !(left || right || above || below);
-    if (o) {
-      return Some({ left:   a.x1 <= b.x2 && a.x1 > b.x1,
-                    right:  a.x2 <= b.x2 && a.x2 > b.x1,
-                    top:    a.y2 <= b.y2 && a.y2 > b.y1,
-                    bottom: a.y1 <= b.y2 && a.y1 > b.y1 });
-    } else {
-      return None;
+    // Create level blocks
+    for (j in 0...Level.BLOCKS_IN_ROW) {
+      for (i in 0...Level.BLOCKS_IN_ROW) {
+        if (level.blocks[j][i] != Space) {
+          createBox(i, j, BLOCK_WIDTH, BLOCK_WIDTH);
+        }
+      }
     }
+
+    var p: Point = level.initPlayerPos;
+    // create player
+
+    player = { movingRight: false, movingLeft: false, jumping: false, body: null,
+               contacts: 0 };
+
+    var playerBody: B2Body = createPlayer(p.x, p.y);
+
+    player.body = playerBody;
+
 	}
 
-  private function rectEqual(a:Rect, b: Rect):Bool {
-    return (a.x1 == b.x1 && a.y1 == b.y1 && a.x2 == b.x2 && a.y2 == b.y2);
+  private function createPlayer(i:Int, j:Int) {
+    var bodyDefinition = new B2BodyDef ();
+    // In Box2D the position of an object is it's centre so we need to add on BLOCK_WIDTH/2
+    // to the position.
+
+    bodyDefinition.position.set ((i + width/2)*BLOCK_WIDTH, (j + height/2)*BLOCK_WIDTH);
+
+    bodyDefinition.type = B2Body.b2_dynamicBody;
+    bodyDefinition.fixedRotation = true;
+
+    var body = world.createBody (bodyDefinition);
+
+    var halfWidth = PLAYER_WIDTH*BLOCK_WIDTH/2;
+    var halfHeight = PLAYER_HEIGHT*BLOCK_WIDTH/2;
+
+    var polygon = new B2PolygonShape();
+    polygon.setAsBox(halfWidth, halfHeight);
+
+    var sensor = new B2PolygonShape();
+    sensor.setAsOrientedBox(0.5*halfWidth, 0.1*BLOCK_WIDTH, new B2Vec2(0, -halfHeight), 0);
+
+    var fixtureDefinition = new B2FixtureDef ();
+    fixtureDefinition.shape = polygon;
+    fixtureDefinition.friction = 0.0;
+
+    body.createFixture(fixtureDefinition);
+
+    fixtureDefinition = new B2FixtureDef();
+    fixtureDefinition.shape = sensor;
+    fixtureDefinition.isSensor = true;
+
+    var sensorFixture: B2Fixture = body.createFixture(fixtureDefinition);
+    sensorFixture.SetUserData({ isSensor: true });
+
+    world.setContactListener(new PlayerContactListener(player));
+
+    return body;
+
   }
 
-	//
-	// For a given side of the player rectangle this returns
-	// +Some(rect)+ where +rect+ is the rectangle of the block
-	// the player collided with or None if the player did not
-	// collide with any blocks
-	//
-	private function collision():Option<Pair<Rect, Collision>> {
-		var b1 = { x1: box.x, y1: box.y,
-			         x2: box.x + PLAYER_WIDTH*blockWidth,
-			         y2: box.y + PLAYER_HEIGHT*blockWidth };
-    for (j in 0...Level.BLOCKS_IN_ROW) {
-    	for (i in 0...Level.BLOCKS_IN_ROW) {
-    		var isBlock = (level.blocks[j][i] != Space);
-    		if (isBlock) {
-       		var b2 = { x1: i*blockWidth,
-       			         y1: j*blockWidth,
-			               x2: (i+1)*blockWidth,
-			               y2: (j+1)*blockWidth  };
-			    switch (overlaps(b1,b2)) {
-            case Some(c):
-  			    	return Some(Pair(b2,c));
-            case None:
-			    }
-			  }
-			}
-		}
-		return None;
+
+  private function createBox (i:Int, j:Int, width:Float, height:Float):B2Body {
+
+    var bodyDefinition = new B2BodyDef ();
+    // In Box2D the position of an object is it's centre so we need to add on BLOCK_WIDTH/2
+    // to the position.
+
+    bodyDefinition.position.set ((i + width/2)*BLOCK_WIDTH, (j + height/2)*BLOCK_WIDTH);
+
+    var polygon = new B2PolygonShape();
+    polygon.setAsBox(width*BLOCK_WIDTH/2, height*BLOCK_WIDTH/2);
+
+    var fixtureDefinition = new B2FixtureDef ();
+    fixtureDefinition.shape = polygon;
+    fixtureDefinition.friction = 0.0;
+
+    var body = world.createBody (bodyDefinition);
+    body.createFixture (fixtureDefinition);
+    return body;
+  }
+
+  //
+  // Draws a rectangle defined by bottom-left corner ([x],[y]), width [w] and height [h]
+  // and color [color] (Color is an RGB value encoded as 32-bit integer. e.g. 0x00FF00FF)
+  // is full red and blue, no green. i.e. magenta.
+  //
+  // [x], [y], [w], [h] are all in world co-ordinates.
+  //
+	private function drawRect(x: Float, y: Float, w: Float, h: Float, color: UInt) {
+		graphics.beginFill(color);
+		graphics.drawRect(x*scale, this.h - (h+y)*scale, w*scale, h*scale);
 	}
 
 	private function updatePositionAndVelocity():Void {
-		// Update position
+    var p = player.body.getPosition();
+    if (player.jumping && player.contacts > 0) {
 
-    if (box.movingRight)  { box.x += RUN_VELOCITY*blockWidth; }
-    if (box.movingLeft)   { box.x -= RUN_VELOCITY*blockWidth; }
-
-    box.v = box.v - ACCEL*blockWidth;
-    box.y = box.y + box.v;
-
-
-	  switch (collision()) {
-	  	case Some(Pair(r,c)):
-
-        if (c.bottom) {
-          box.y = r.y2;
-	    	  box.v = 0;
-	    	  if (box.jumpPressed) { box.v = JUMP_VELOCITY*blockWidth; }
-        } else if (c.top) {
-          box.y = r.y1 - PLAYER_HEIGHT*blockWidth;
-          box.v = 0;
-        }
-
-      case None:
+      player.body.setLinearVelocity(new B2Vec2(0, JUMP_VELOCITY*BLOCK_WIDTH));
     }
 
-    switch (collision()) {
-      case Some(Pair(r,c)):
-        if (c.right) {
-          box.x = r.x1 - PLAYER_WIDTH*blockWidth;
-        } else if (c.left) {
-          box.x = r.x2;
-        }
-      case None:
+    var v: Float = 0;
+    if (player.movingLeft) {
+      v -= RUN_VELOCITY*BLOCK_WIDTH;
     }
+
+    if (player.movingRight) {
+      v += RUN_VELOCITY*BLOCK_WIDTH;
+    }
+
+    var lv = player.body.getLinearVelocity();
+    player.body.setLinearVelocity(new B2Vec2(v, lv.y));
+    // HACK. Bump up player by just smallest amount
+    player.body.setPosition(new B2Vec2(p.x, p.y + 0.01));
 
 	}
 
 	private function drawLevel() {
+    graphics.clear();
 		for (j in 0...Level.BLOCKS_IN_ROW) {
 			for (i in 0...Level.BLOCKS_IN_ROW) {
         // only draw block if it's visible
@@ -208,10 +341,17 @@ class Main extends Sprite {
   						          case Blue:  0x0000FF;
   						          default:    0x000000;
                				};
-          drawBox(i*blockWidth, j*blockWidth, blockWidth, blockWidth, color);
+          drawRect(i*BLOCK_WIDTH, j*BLOCK_WIDTH, BLOCK_WIDTH, BLOCK_WIDTH, color);
         }
 			}
 		}
+
+    // Draw player
+    var p = player.body.getPosition();
+    var x = p.x - PLAYER_WIDTH*BLOCK_WIDTH/2;
+    var y = p.y - PLAYER_HEIGHT*BLOCK_WIDTH/2;
+    drawRect(x, y, PLAYER_WIDTH*BLOCK_WIDTH, PLAYER_HEIGHT*BLOCK_WIDTH, 0x00FF00FF);
+
 	}
 
   private function toggleBlockVisibility(b: Block) {
@@ -225,19 +365,19 @@ class Main extends Sprite {
 
 	// Events -- enabled with addEventListener. Requires flash.events.Event;
   private function onEnterFrame (event:Event):Void {
-  	graphics.clear();
-	  drawLevel();
+    world.step (1 / STEPS_PER_SECOND, 10, 10);
+    world.clearForces();
+//    world.drawDebugData();
+    drawLevel();
   	updatePositionAndVelocity();
-  	drawBox(box.x,box.y,PLAYER_WIDTH*blockWidth,PLAYER_HEIGHT*blockWidth, 0xFF00FF);
-
-
+    // draw the player
   }
 
   private function onKeyDown(event: KeyboardEvent):Void {
   	switch event.keyCode {
-  		case Keyboard.RIGHT: box.movingRight = true;
-  		case Keyboard.LEFT:  box.movingLeft  = true;
-  		case Keyboard.UP:    box.jumpPressed = true;
+  		case Keyboard.RIGHT: player.movingRight = true;
+  		case Keyboard.LEFT:  player.movingLeft  = true;
+  		case Keyboard.UP:    player.jumping = true;
       case Keyboard.R: toggleBlockVisibility(Red);
       case Keyboard.B: toggleBlockVisibility(Blue);
   	}
@@ -245,9 +385,9 @@ class Main extends Sprite {
 
   private function onKeyUp(event: KeyboardEvent):Void {
   	switch event.keyCode {
-  		case Keyboard.RIGHT: box.movingRight = false;
-  		case Keyboard.LEFT:  box.movingLeft  = false;
-  		case Keyboard.UP:    box.jumpPressed = false;
+  		case Keyboard.RIGHT: player.movingRight = false;
+  		case Keyboard.LEFT:  player.movingLeft  = false;
+  		case Keyboard.UP:    player.jumping = false;
   	}
   }
 

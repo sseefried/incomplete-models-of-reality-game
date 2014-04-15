@@ -1,12 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <project>
 
-	<meta title="JumpingBox" package="com.example.jumpingbox" version="1.0.0" company="Company Name" />
+	<meta title="JumpingBox" package="com.example.jumpingbox" version="0.1.0"
+		    company="Seefried Software" />
 	<app main="Main" path="Export" file="JumpingBox" />
 
 	<source path="Source" />
-
-
 
 <window width="512" height="512"
 	      orientation="portrait"
@@ -15,8 +14,9 @@
 	      resizable="false"
 	      borderless="false" />
 
-
+  <!-- List of all libraries you are importing -->
 	<haxelib name="openfl" />
+	<haxelib name="box2d" />
 
 	<assets path="Assets" rename="assets" exclude="openfl.svg" />
 	<icon path="Assets/openfl.svg" />
